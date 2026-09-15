@@ -199,14 +199,29 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
     }
 
     #[inline(always)]
-    fn sub_block_rank(&self, sub_bpos: usize) -> usize {
+    fn sub_block_rank(&self, sub_bpos: usize) -> Option<usize> {
         let (block, left) = (sub_bpos / BLOCK_LEN, sub_bpos % BLOCK_LEN);
-        self.block_rank(block) + ((self.sub_block_ranks(block) >> ((7 - left) * 9)) & 0x1FF)
+        self.checked_block_rank(block)?
+            .checked_add((self.checked_sub_block_ranks(block)? >> ((7 - left) * 9)) & 0x1FF)
     }
 
     #[inline(always)]
-    fn sub_block_ranks(&self, block: usize) -> usize {
-        self.block_rank_pairs[block * 2 + 1]
+    fn checked_sub_block_ranks(&self, block: usize) -> Option<usize> {
+        self.block_rank_pairs
+            .get(block.checked_mul(2)?.checked_add(1)?)
+            .copied()
+    }
+
+    #[inline(always)]
+    fn checked_block_rank(&self, block: usize) -> Option<usize> {
+        self.block_rank_pairs.get(block.checked_mul(2)?).copied()
+    }
+
+    #[inline(always)]
+    fn checked_block_rank0(&self, block: usize) -> Option<usize> {
+        block
+            .checked_mul(BLOCK_LEN * 64)?
+            .checked_sub(self.checked_block_rank(block)?)
     }
 
     #[inline(always)]
@@ -246,7 +261,7 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
     /// assert_eq!(idx.rank1(&data, 5), None);
     /// ```
     pub fn rank1(&self, data: &BitVectorData, pos: usize) -> Option<usize> {
-        if data.len() < pos {
+        if data.len() != self.len || data.len() < pos {
             return None;
         }
         if pos == data.len() {
@@ -258,15 +273,15 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
         // flight together. The word is consumed only after the directory
         // arithmetic, leaving useful work between its load and popcount.
         let word = if sub_left != 0 {
-            Some(data.words()[sub_bpos])
+            Some(*data.words().get(sub_bpos)?)
         } else {
             None
         };
-        let mut r = self.sub_block_rank(sub_bpos);
+        let mut r = self.sub_block_rank(sub_bpos)?;
         if let Some(word) = word {
-            r += broadword::popcount(word << (64 - sub_left));
+            r = r.checked_add(broadword::popcount(word << (64 - sub_left)))?;
         }
-        Some(r)
+        (r <= pos).then_some(r)
     }
 
     /// Returns the number of zeros from the 0-th bit to the `pos-1`-th bit, or
@@ -298,7 +313,7 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
     /// assert_eq!(idx.rank0(&data, 5), None);
     /// ```
     pub fn rank0(&self, data: &BitVectorData, pos: usize) -> Option<usize> {
-        Some(pos - self.rank1(data, pos)?)
+        pos.checked_sub(self.rank1(data, pos)?)
     }
 
     /// Searches the position of the `k`-th bit set, or
@@ -330,7 +345,7 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
     /// assert_eq!(idx.select1(&data, 2), None);
     /// ```
     pub fn select1(&self, data: &BitVectorData, k: usize) -> Option<usize> {
-        if self.num_ones() <= k {
+        if data.len() != self.len || self.num_ones() <= k {
             return None;
         }
 
@@ -339,13 +354,16 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
             if let Some(select1_hints) = self.select1_hints.as_ref() {
                 let chunk = k / SELECT_ONES_PER_HINT;
                 if chunk != 0 {
-                    a = select1_hints[chunk - 1];
+                    a = *select1_hints.get(chunk - 1)?;
                 }
-                b = select1_hints[chunk] + 1;
+                b = select1_hints.get(chunk)?.checked_add(1)?;
             }
-            while b - a > 1 {
-                let mid = a + (b - a) / 2;
-                let x = self.block_rank(mid);
+            if a >= self.num_blocks() || b > self.num_blocks().checked_add(1)? || a >= b {
+                return None;
+            }
+            while b.checked_sub(a)? > 1 {
+                let mid = a.checked_add((b - a) / 2)?;
+                let x = self.checked_block_rank(mid)?;
                 if x <= k {
                     a = mid;
                 } else {
@@ -355,24 +373,43 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
             a
         };
 
-        debug_assert!(block < self.num_blocks());
-        let block_offset = block * BLOCK_LEN;
-        let mut cur_rank = self.block_rank(block);
-        debug_assert!(cur_rank <= k);
+        if block >= self.num_blocks() {
+            return None;
+        }
+        let block_offset = block.checked_mul(BLOCK_LEN)?;
+        let mut cur_rank = self.checked_block_rank(block)?;
 
-        let rank_in_block_parallel = (k - cur_rank) as u64 * broadword::ONES_STEP_9;
-        let sub_ranks = self.sub_block_ranks(block) as u64;
+        let rank_in_block = k.checked_sub(cur_rank)?;
+        if rank_in_block >= BLOCK_LEN * 64 {
+            return None;
+        }
+        let rank_in_block_parallel = (rank_in_block as u64).checked_mul(broadword::ONES_STEP_9)?;
+        let sub_ranks = self.checked_sub_block_ranks(block)? as u64;
+        // Seven 9-bit lanes leave the high bit unused. The broadword
+        // subtraction relies on that bound; inspect only this queried word.
+        if sub_ranks >> 63 != 0 {
+            return None;
+        }
         let sub_block_offset = ((broadword::uleq_step_9(sub_ranks, rank_in_block_parallel)
             .wrapping_mul(broadword::ONES_STEP_9)
             >> 54)
             & 0x7) as usize;
-        cur_rank += ((sub_ranks >> (7 - sub_block_offset).wrapping_mul(9)) & 0x1FF) as usize;
-        debug_assert!(cur_rank <= k);
+        cur_rank = cur_rank.checked_add(
+            ((sub_ranks >> (7 - sub_block_offset).wrapping_mul(9)) & 0x1FF) as usize,
+        )?;
 
-        let word_offset = block_offset + sub_block_offset;
-        let sel = word_offset * 64
-            + broadword::select_in_word(data.words()[word_offset], k - cur_rank).unwrap();
-        Some(sel)
+        let word_offset = block_offset.checked_add(sub_block_offset)?;
+        let within_word = k.checked_sub(cur_rank)?;
+        if within_word >= 64 {
+            return None;
+        }
+        let sel = word_offset
+            .checked_mul(64)?
+            .checked_add(broadword::select_in_word(
+                *data.words().get(word_offset)?,
+                within_word,
+            )?)?;
+        (sel < data.len()).then_some(sel)
     }
 
     /// Searches the position of the `k`-th bit unset, or
@@ -403,7 +440,7 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
     /// assert_eq!(idx.select0(&data, 2), None);
     /// ```
     pub fn select0(&self, data: &BitVectorData, k: usize) -> Option<usize> {
-        if self.num_zeros() <= k {
+        if data.len() != self.len || self.num_zeros() <= k {
             return None;
         }
 
@@ -412,13 +449,16 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
             if let Some(select0_hints) = self.select0_hints.as_ref() {
                 let chunk = k / SELECT_ZEROS_PER_HINT;
                 if chunk != 0 {
-                    a = select0_hints[chunk - 1];
+                    a = *select0_hints.get(chunk - 1)?;
                 }
-                b = select0_hints[chunk] + 1;
+                b = select0_hints.get(chunk)?.checked_add(1)?;
             }
-            while b - a > 1 {
-                let mid = a + (b - a) / 2;
-                let x = self.block_rank0(mid);
+            if a >= self.num_blocks() || b > self.num_blocks().checked_add(1)? || a >= b {
+                return None;
+            }
+            while b.checked_sub(a)? > 1 {
+                let mid = a.checked_add((b - a) / 2)?;
+                let x = self.checked_block_rank0(mid)?;
                 if x <= k {
                     a = mid;
                 } else {
@@ -428,24 +468,39 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
             a
         };
 
-        debug_assert!(block < self.num_blocks());
-        let block_offset = block * BLOCK_LEN;
-        let mut cur_rank = self.block_rank0(block);
-        debug_assert!(cur_rank <= k);
+        if block >= self.num_blocks() {
+            return None;
+        }
+        let block_offset = block.checked_mul(BLOCK_LEN)?;
+        let mut cur_rank = self.checked_block_rank0(block)?;
 
-        let rank_in_block_parallel = (k - cur_rank) as u64 * broadword::ONES_STEP_9;
-        let sub_ranks = 64u64 * broadword::INV_COUNT_STEP_9 - self.sub_block_ranks(block) as u64;
+        let rank_in_block = k.checked_sub(cur_rank)?;
+        if rank_in_block >= BLOCK_LEN * 64 {
+            return None;
+        }
+        let rank_in_block_parallel = (rank_in_block as u64).checked_mul(broadword::ONES_STEP_9)?;
+        let sub_ranks = (64u64 * broadword::INV_COUNT_STEP_9)
+            .checked_sub(self.checked_sub_block_ranks(block)? as u64)?;
         let sub_block_offset = ((broadword::uleq_step_9(sub_ranks, rank_in_block_parallel)
             .wrapping_mul(broadword::ONES_STEP_9)
             >> 54)
             & 0x7) as usize;
-        cur_rank += ((sub_ranks >> (7 - sub_block_offset).wrapping_mul(9)) & 0x1FF) as usize;
-        debug_assert!(cur_rank <= k);
+        cur_rank = cur_rank.checked_add(
+            ((sub_ranks >> (7 - sub_block_offset).wrapping_mul(9)) & 0x1FF) as usize,
+        )?;
 
-        let word_offset = block_offset + sub_block_offset;
-        let sel = word_offset * 64
-            + broadword::select_in_word(!data.words()[word_offset], k - cur_rank).unwrap();
-        Some(sel)
+        let word_offset = block_offset.checked_add(sub_block_offset)?;
+        let within_word = k.checked_sub(cur_rank)?;
+        if within_word >= 64 {
+            return None;
+        }
+        let sel = word_offset
+            .checked_mul(64)?
+            .checked_add(broadword::select_in_word(
+                !*data.words().get(word_offset)?,
+                within_word,
+            )?)?;
+        (sel < data.len()).then_some(sel)
     }
 }
 
@@ -498,10 +553,67 @@ impl<const SELECT1: bool, const SELECT0: bool> Rank9SelIndex<SELECT1, SELECT0> {
     /// flags, but cannot prove that the index was derived from a particular bit
     /// vector. For compatibility with the original parser, any nonzero hint
     /// flag is accepted as enabled and trailing bytes are ignored. Prefer
-    /// [`Self::from_bytes_for_data`] when attaching persisted data to a bit
-    /// vector; that path requires canonical flags and exact framing.
+    /// [`Self::from_bytes_with_len`] for exact framing and query-addressable
+    /// geometry, or [`Self::from_bytes_for_data`] for an explicit content audit.
     pub fn from_bytes(bytes: Bytes) -> Result<Self> {
         Self::parse(bytes, false)
+    }
+
+    /// Attaches a persisted index with exact typed framing and geometry.
+    ///
+    /// This does not read the source words or prove rank/select contents.
+    /// Their correctness belongs to the producer; [`Self::validate_for`] is
+    /// the explicit full audit. The byte owner is retained without copying.
+    pub fn from_bytes_with_len(len: usize, bytes: Bytes) -> Result<Self> {
+        let index = Self::parse(bytes, true)?;
+        if index.len != len {
+            return Err(Error::invalid_metadata(
+                "Rank9 length does not match source length",
+            ));
+        }
+        let blocks = len.div_ceil(64).div_ceil(BLOCK_LEN);
+        let pairs = blocks
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| Error::invalid_metadata("Rank9 directory length overflow"))?;
+        if index.block_rank_pairs.len() != pairs {
+            return Err(Error::invalid_metadata(
+                "Rank9 directory has the wrong length",
+            ));
+        }
+        if index.num_ones() > len {
+            return Err(Error::invalid_metadata(
+                "Rank9 total exceeds its declared bit length",
+            ));
+        }
+        let padded_bits = blocks
+            .checked_mul(BLOCK_LEN * 64)
+            .ok_or_else(|| Error::invalid_metadata("Rank9 block span overflow"))?;
+        // The persisted zero hints include the final block's padding, as in
+        // the builder. Only query-addressable geometry is checked here; no
+        // interior hint or rank entry is visited.
+        for (hints, total, per_hint) in [
+            (
+                index.select1_hints.as_deref(),
+                index.num_ones(),
+                SELECT_ONES_PER_HINT,
+            ),
+            (
+                index.select0_hints.as_deref(),
+                padded_bits - index.num_ones(),
+                SELECT_ZEROS_PER_HINT,
+            ),
+        ] {
+            if let Some(hints) = hints {
+                let expected_hints = total.saturating_sub(1) / per_hint + 1;
+                if hints.len() != expected_hints || hints.last().copied() != Some(blocks) {
+                    return Err(Error::invalid_metadata(
+                        "Rank9 select hints have the wrong geometry",
+                    ));
+                }
+            }
+        }
+        Ok(index)
     }
 
     /// Reconstructs and validates a persisted index for `data`.
@@ -792,6 +904,206 @@ mod tests {
     }
 
     #[test]
+    fn typed_attach_borrows_index_without_reproving_rank_contents() {
+        let data = BitVectorData::from_bits((0..1500).map(|i| i % 5 == 0));
+        let index = Rank9SelIndex::<true, true>::new(&data);
+        let bytes = persisted_bytes(&index);
+        let attached =
+            Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), bytes.clone()).unwrap();
+        assert_eq!(
+            attached.block_rank_pairs.as_ptr() as usize,
+            bytes.as_ptr() as usize + 2 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(attached, index);
+        for position in 0..=data.len() {
+            assert_eq!(
+                attached.rank1(&data, position),
+                index.rank1(&data, position)
+            );
+        }
+        let mut words = serialized_words(&index);
+        words[2] ^= 1; // Incorrect base rank, but valid typed framing and geometry.
+        let attached =
+            Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), Bytes::from_source(words))
+                .unwrap();
+        assert!(attached.validate_for(&data).is_err());
+    }
+
+    #[test]
+    fn typed_attach_rejects_truncation_length_and_unbounded_directory_counts() {
+        let data = BitVectorData::from_bits([true, false, true]);
+        let index = Rank9SelIndex::<true, true>::new(&data);
+        let bytes = persisted_bytes(&index);
+        for length in 0..bytes.len() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), bytes.slice(..length))
+            }));
+            assert!(matches!(result, Ok(Err(_))), "truncated index {length}");
+        }
+        assert!(Rank9SelIndex::<true, true>::from_bytes_with_len(data.len() + 1, bytes).is_err());
+        let mut words = serialized_words(&index);
+        words[1] = usize::MAX;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), Bytes::from_source(words))
+        }));
+        assert!(matches!(result, Ok(Err(_))));
+    }
+
+    #[test]
+    fn typed_attach_rejects_empty_or_wrong_terminal_hint_geometry() {
+        // Both flags are enabled but their arrays are empty. Previously this
+        // attached successfully and select1 indexed an absent first hint.
+        let empty_hints = vec![1usize, 4, 0, 0, 1, 0, 1, 0, 1, 0];
+        assert!(Rank9SelIndex::<true, true>::from_bytes_with_len(
+            1,
+            Bytes::from_source(empty_hints),
+        )
+        .is_err());
+        let empty_zero_hints = vec![1usize, 4, 0, 0, 0, 0, 0, 1, 0];
+        assert!(Rank9SelIndex::<false, true>::from_bytes_with_len(
+            1,
+            Bytes::from_source(empty_zero_hints),
+        )
+        .is_err());
+
+        let data = BitVectorData::from_bits([true, false]);
+        let index = Rank9SelIndex::<true, true>::new(&data);
+        let original = serialized_words(&index);
+        let select1_start = 2 + original[1] + 2;
+        let select0_start = select1_start + original[select1_start - 1] + 2;
+        for start in [select1_start, select0_start] {
+            let mut words = original.clone();
+            words[start] = usize::MAX;
+            assert!(Rank9SelIndex::<true, true>::from_bytes_with_len(
+                data.len(),
+                Bytes::from_source(words),
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn typed_hint_geometry_counts_padded_zeros() {
+        let data = BitVectorData::from_bits((0..1025).map(|i| i == 0));
+        let index = Rank9SelIndex::<true, true>::new(&data);
+        assert_eq!(index.num_blocks(), 3);
+        assert_eq!(index.num_zeros(), 1024);
+        // The final 512-bit block has 511 unused zeros. The wire therefore
+        // carries two zero hints, even though there are 1024 logical zeros.
+        assert_eq!(index.select0_hints.as_ref().unwrap().len(), 2);
+        let attached =
+            Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), persisted_bytes(&index))
+                .unwrap();
+        assert_eq!(attached.select1(&data, 0), Some(0));
+        for k in 0..1024 {
+            assert_eq!(attached.select0(&data, k), Some(k + 1));
+        }
+        assert_eq!(attached.select0(&data, 1024), None);
+
+        let mut words = serialized_words(&index);
+        let select1_start = 2 + words[1] + 2;
+        let select0_start = select1_start + words[select1_start - 1] + 2;
+        words[select0_start - 1] = 1;
+        words.remove(select0_start);
+        assert!(Rank9SelIndex::<true, true>::from_bytes_with_len(
+            data.len(),
+            Bytes::from_source(words),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn typed_attach_defers_interior_hint_checks_to_the_queried_interval() {
+        for ones in [false, true] {
+            let data = BitVectorData::from_bits((0..8193).map(|_| ones));
+            let index = Rank9SelIndex::<true, true>::new(&data);
+            let original = serialized_words(&index);
+            let select1_start = 2 + original[1] + 2;
+            let select0_start = select1_start + original[select1_start - 1] + 2;
+            let start = if ones { select1_start } else { select0_start };
+            assert!(original[start - 1] > 2);
+            let query = |words, k| {
+                let attached = Rank9SelIndex::<true, true>::from_bytes_with_len(
+                    data.len(),
+                    Bytes::from_source(words),
+                )
+                .unwrap();
+                if ones {
+                    attached.select1(&data, k)
+                } else {
+                    attached.select0(&data, k)
+                }
+            };
+
+            let mut overflow = original.clone();
+            overflow[start] = usize::MAX;
+            assert_eq!(query(overflow, 0), None);
+            let mut out_of_range = original.clone();
+            out_of_range[start] = index.num_blocks() + 1;
+            assert_eq!(query(out_of_range, 0), None);
+            let mut reversed = original.clone();
+            reversed[start] = 2;
+            reversed[start + 1] = 0;
+            assert_eq!(query(reversed, SELECT_ONES_PER_HINT), None);
+
+            let mut corrupt_later = original;
+            corrupt_later[start + 1] = usize::MAX;
+            // Attaching does not scan the interior hint array, and a query
+            // in an unrelated first interval still uses its valid entry.
+            assert_eq!(query(corrupt_later.clone(), 0), Some(0));
+            assert_eq!(query(corrupt_later, SELECT_ONES_PER_HINT), None);
+        }
+    }
+
+    #[test]
+    fn typed_queries_reject_malformed_rank_arithmetic_and_missing_word_matches() {
+        let data = BitVectorData::from_bits([true, false]);
+        let index = Rank9SelIndex::<true, true>::new(&data);
+        let mut words = serialized_words(&index);
+        words[2] = usize::MAX;
+        let attached =
+            Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), Bytes::from_source(words))
+                .unwrap();
+        assert_eq!(attached.rank1(&data, 0), None);
+        assert_eq!(attached.rank1(&data, 1), None);
+        assert_eq!(attached.rank0(&data, 1), None);
+        assert_eq!(attached.select1(&data, 0), None);
+        assert_eq!(attached.select0(&data, 0), None);
+
+        let mut words = serialized_words(&index);
+        words[3] = usize::MAX; // Outside the packed seven 9-bit lane shape.
+        let attached =
+            Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), Bytes::from_source(words))
+                .unwrap();
+        assert_eq!(attached.select1(&data, 0), None);
+        assert_eq!(attached.select0(&data, 0), None);
+
+        let attached =
+            Rank9SelIndex::<true, true>::from_bytes_with_len(data.len(), persisted_bytes(&index))
+                .unwrap();
+        // Contents are deliberately not checked during attach. A queried
+        // directory claim with no matching source bit must fail, not unwrap.
+        let zeros = BitVectorData::from_bits([false, false]);
+        let ones = BitVectorData::from_bits([true, true]);
+        assert_eq!(attached.select1(&zeros, 0), None);
+        assert_eq!(attached.select0(&ones, 0), None);
+        let wrong_len = BitVectorData::from_bits([true]);
+        assert_eq!(attached.rank1(&wrong_len, 0), None);
+        assert_eq!(attached.select1(&wrong_len, 0), None);
+        assert_eq!(attached.select0(&wrong_len, 0), None);
+        let missing_words = BitVectorData {
+            words: Bytes::from_source(Vec::<u64>::new())
+                .view::<[u64]>()
+                .unwrap(),
+            len: data.len(),
+            handle: None,
+        };
+        assert_eq!(attached.rank1(&missing_words, 1), None);
+        assert_eq!(attached.select1(&missing_words, 0), None);
+        assert_eq!(attached.select0(&missing_words, 0), None);
+    }
+
+    #[test]
     fn persisted_format_matches_legacy_encoding() {
         let data = BitVectorData::from_bits((0..4097).map(|i| i % 3 == 0 || i % 11 == 0));
         let index = Rank9SelIndex::<true, true>::new(&data);
@@ -819,6 +1131,32 @@ mod tests {
     fn assert_boundary_roundtrip<const SELECT1: bool, const SELECT0: bool>(bits: &[bool]) {
         let data = BitVectorData::from_bits(bits.iter().copied());
         let index = Rank9SelIndex::<SELECT1, SELECT0>::new(&data);
+        let typed = Rank9SelIndex::<SELECT1, SELECT0>::from_bytes_with_len(
+            data.len(),
+            persisted_bytes(&index),
+        )
+        .unwrap();
+        assert_eq!(typed, index);
+        for position in 0..=data.len() {
+            let ones = bits[..position].iter().filter(|&&bit| bit).count();
+            assert_eq!(typed.rank1(&data, position), Some(ones));
+            assert_eq!(typed.rank0(&data, position), Some(position - ones));
+        }
+        for bit in [false, true] {
+            let positions: Vec<_> = bits
+                .iter()
+                .enumerate()
+                .filter_map(|(pos, &value)| (value == bit).then_some(pos))
+                .collect();
+            for k in 0..=positions.len() {
+                let actual = if bit {
+                    typed.select1(&data, k)
+                } else {
+                    typed.select0(&data, k)
+                };
+                assert_eq!(actual, positions.get(k).copied());
+            }
+        }
         let attached =
             Rank9SelIndex::<SELECT1, SELECT0>::from_bytes_for_data(&data, persisted_bytes(&index))
                 .unwrap();
@@ -827,7 +1165,7 @@ mod tests {
 
     #[test]
     fn all_hint_modes_roundtrip_at_word_and_block_boundaries() {
-        for &len in &[0usize, 63, 64, 65, 511, 512, 513, 1023, 1024, 1025] {
+        for &len in &[0usize, 1, 63, 64, 65, 511, 512, 513, 1023, 1024, 1025] {
             let bits: Vec<bool> = (0..len).map(|i| i % 5 == 0 || i % 7 == 3).collect();
             assert_boundary_roundtrip::<true, true>(&bits);
             assert_boundary_roundtrip::<true, false>(&bits);

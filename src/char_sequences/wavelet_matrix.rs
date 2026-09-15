@@ -94,19 +94,47 @@ const MIN_BATCH: usize = 8;
 pub struct WaveletMatrix<I> {
     layers: Vec<BitVector<I>>,
     alph_size: usize,
-    layers_handle: SectionHandle<SectionHandle<u64>>,
+    layers_handle: Option<SectionHandle<SectionHandle<u64>>>,
 }
 
 impl<I: PartialEq> PartialEq for WaveletMatrix<I> {
     fn eq(&self, other: &Self) -> bool {
         self.layers == other.layers
             && self.alph_size == other.alph_size
-            && self.layers_handle.offset == other.layers_handle.offset
-            && self.layers_handle.len == other.layers_handle.len
+            && self.layers_handle.map(|h| (h.offset, h.len))
+                == other.layers_handle.map(|h| (h.offset, h.len))
     }
 }
 
 impl<I: Eq> Eq for WaveletMatrix<I> {}
+
+impl<I: BitVectorIndex> WaveletMatrix<I> {
+    /// Attaches already-viewed layers without constructing indexes or copying
+    /// their words. Layers are ordered MSB first and must have equal lengths.
+    /// This checks geometry, not the mathematical contents of the layers.
+    ///
+    /// No serialized layer table is manufactured. Like handle-less
+    /// [`BitVectorData`], this query view cannot supply serialization metadata;
+    /// calling [`Self::metadata`] on it panics.
+    pub fn from_layers(alph_size: usize, layers: Vec<BitVector<I>>) -> Result<Self> {
+        if layers.len() != utils::alphabet_width(alph_size) {
+            return Err(Error::invalid_metadata(
+                "wavelet layer count does not match alphabet",
+            ));
+        }
+        let len = layers.first().map_or(0, |layer| layer.data.len());
+        if layers.iter().any(|layer| layer.data.len() != len) {
+            return Err(Error::invalid_metadata(
+                "wavelet layers have different lengths",
+            ));
+        }
+        Ok(Self {
+            layers,
+            alph_size,
+            layers_handle: None,
+        })
+    }
+}
 
 /// Metadata describing the serialized form of a [`WaveletMatrix`].
 #[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
@@ -281,7 +309,7 @@ impl<'a> WaveletMatrixBuilder<'a> {
         Ok(WaveletMatrix {
             layers,
             alph_size: self.alph_size,
-            layers_handle,
+            layers_handle: Some(layers_handle),
         })
     }
 }
@@ -492,7 +520,7 @@ where
         Ok(WaveletMatrix {
             layers,
             alph_size,
-            layers_handle,
+            layers_handle: Some(layers_handle),
         })
     }
 
@@ -1486,7 +1514,7 @@ impl<const SELECT1: bool, const SELECT0: bool> WaveletMatrix<Rank9SelIndex<SELEC
         Ok(Self {
             layers,
             alph_size: meta.alph_size,
-            layers_handle: meta.layers,
+            layers_handle: Some(meta.layers),
         })
     }
 }
@@ -1500,7 +1528,9 @@ impl<I: BitVectorIndex> Serializable for WaveletMatrix<I> {
             alph_size: self.alph_size,
             alph_width: self.alph_width(),
             len: self.len(),
-            layers: self.layers_handle,
+            layers: self
+                .layers_handle
+                .expect("matrix has no serialized layer table"),
         }
     }
 
@@ -1536,7 +1566,7 @@ impl<I: BitVectorIndex> Serializable for WaveletMatrix<I> {
         Ok(Self {
             layers,
             alph_size: meta.alph_size,
-            layers_handle: meta.layers,
+            layers_handle: Some(meta.layers),
         })
     }
 }
@@ -1592,6 +1622,23 @@ mod test {
             .expect("empty iterator should build successfully");
         assert_eq!(wm.len(), 0);
         assert!(wm.is_empty());
+    }
+
+    #[test]
+    fn from_layers_borrows_words_and_does_not_build_indexes() {
+        use crate::bit_vector::NoIndex;
+        let data = BitVectorData::from_bits([false, true, true, false]);
+        let pointer = data.words().as_ptr();
+        let matrix = WaveletMatrix::from_layers(2, vec![BitVector::new(data, NoIndex)]).unwrap();
+        assert_eq!(matrix.layers[0].data.words().as_ptr(), pointer);
+        assert!(matrix.layers_handle.is_none());
+        assert_eq!(matrix.iter().collect::<Vec<_>>(), vec![0, 1, 1, 0]);
+        assert_eq!(matrix.rank(4, 1), Some(2));
+        assert_eq!(matrix.access(4), None);
+        assert!(WaveletMatrix::<NoIndex>::from_layers(2, Vec::new()).is_err());
+        let a = BitVector::new(BitVectorData::from_bits([true]), NoIndex);
+        let b = BitVector::new(BitVectorData::from_bits([false, true]), NoIndex);
+        assert!(WaveletMatrix::from_layers(4, vec![a, b]).is_err());
     }
 
     #[test]
