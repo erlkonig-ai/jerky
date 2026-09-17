@@ -1,6 +1,16 @@
 # Changelog
 
 ## Unreleased
+- Added structural-only `Rank9SelIndex::from_bytes_with_len` attachment and
+  `WaveletMatrix::from_layers` for borrowed query layers without a synthesized
+  serialization table. These preserve the original byte owners and construct
+  no indexes. Full rank/select verification remains explicit in `validate_for`
+  and `from_bytes_for_data`; framing, geometry and truncation checks remain on
+  ordinary attachment. Tests distinguish semantic audit from typed attachment
+  and check backing pointers and raw `NoIndex` queries. Rank9 attachment checks
+  hint-array lengths and terminal block sentinels in constant time, preserving
+  the format's padded-zero convention; individual query paths use fallible
+  hint/word access and checked arithmetic without scanning rank contents.
 - Wavelet matrices now use the minimum code width
   `max(1, bit_length(alphabet_size - 1))`, removing the redundant leading-zero
   plane at power-of-two cardinalities. CPU and GPU rank/select APIs explicitly
