@@ -1,6 +1,6 @@
 [package]
 name = "jerky"
-version = "0.9.0"
+version = "0.10.0"
 authors = ["Shunsuke Kanda (kampersanda) <shnsk.knd@gmail.com>",
            "Jan-Paul Bultmann (somethingelseentirely) <jp@bultmann.eu>"]
 description = "Succinct on-disk data structures in Rust"
@@ -18,9 +18,9 @@ rust-version = "1.61.0"
 
 [dependencies]
 num-traits = "0.2.15"
-anybytes = { version = "0.20.2", features = ["zerocopy", "mmap"] }
+anybytes = { version = "0.20.3", path = "../anybytes", features = ["zerocopy", "mmap"] }
 zerocopy = "0.8"
-cubecl = { version = "0.10.0", default-features = false, features = ["wgpu", "std"], optional = true }
+cubecl = { package = "maryml-cubecl", version = "0.10.0", path = "../cubecl-fork/crates/cubecl", default-features = false, features = ["wgpu", "std"], optional = true }
 
 [features]
 default = []

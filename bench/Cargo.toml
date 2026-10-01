@@ -6,9 +6,9 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-jerky = { path = "..", features = ["intrinsics"] } # Recommend to set RUSTFLAGS="-C target-cpu=native"
+jerky = { path = "..", features = ["intrinsics"], version = "0.10.0" }
 rand = "0.8.4"
-anybytes = { version = "0.20.2", features = ["zerocopy", "mmap"] }
+anybytes = { version = "0.20.3", features = ["zerocopy", "mmap"], path = "../../anybytes" }
 rand_chacha = "0.3.1"
 suffix = "1.3.0"
 

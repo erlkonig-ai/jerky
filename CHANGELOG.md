@@ -1,6 +1,17 @@
 # Changelog
 
 ## Unreleased
+
+## 0.10.0 - 2026-10-01
+
+- Release the implementation pinned by the TribleSpace cohort at
+  `a03b927dc9d1fac0e6085f1275cd8f8504c36648`, including its resident GPU APIs.
+- Use the published `maryml-cubecl` package behind the existing `cubecl` Rust
+  alias for the optional GPU feature, and require AnyBytes 0.20.3. Numerical
+  and data-structure source is unchanged by this release metadata update.
+
+## Earlier development
+
 - Added structural-only `Rank9SelIndex::from_bytes_with_len` attachment and
   `WaveletMatrix::from_layers` for borrowed query layers without a synthesized
   serialization table. These preserve the original byte owners and construct
